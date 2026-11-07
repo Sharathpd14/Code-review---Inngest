@@ -1,5 +1,7 @@
+import { githubPullRequestReviewAgent } from "../../agent/github-pr-review-agent.js";
 import { octokit } from "../../lib/github.js";
 import { inngest } from "../client.js"
+import { run } from '@openai/agents';
 
 export const githubPullRequestReview = inngest.createFunction(
     {
@@ -14,7 +16,6 @@ export const githubPullRequestReview = inngest.createFunction(
         const pullRequestInfo = await step.run("fetch-pullrequest-inforation", async () => {
             try {
                 const pullRequestObject = await octokit.pulls.get({ owner, repo, pull_number });
-                console.log("pullRequestObject",pullRequestObject)
                 return {
                     id: pullRequestObject.data.id,
                     title: pullRequestObject.data.title,
@@ -25,6 +26,10 @@ export const githubPullRequestReview = inngest.createFunction(
                     diffUrl: pullRequestObject.data.diff_url,
                     changes: pullRequestObject.data.changes,
                     commits: pullRequestObject.data.commits,
+                    head: {
+                        ref: pullRequestObject.data.head.ref,
+                        sha: pullRequestObject.data.head.sha,
+                    },
                 }
             } catch (error) {
                 return null
@@ -32,25 +37,63 @@ export const githubPullRequestReview = inngest.createFunction(
         });
         if (!pullRequestInfo) return { message: "Pull request not found", skip: true }
         if (pullRequestInfo.state !== "open") return { message: "Pull request is not open, Skipping the review", skip: true, completed: false }
-        const changes = await step.run("fetch-changes", async ()=>{
+        const changes = await step.run("fetch-changes", async () => {
             const changesResult = await octokit.paginate(octokit.pulls.listFiles, {
-                owner, repo, pull_number, per_page : 100
+                owner, repo, pull_number, per_page: 100
             })
-            return changesResult.map(change =>({
-                filename : change.filename,
-                status : change.status,
-                changes : change.changes,
+            return changesResult.map(change => ({
+                filename: change.filename,
+                status: change.status,
+                changes: change.changes,
                 patch: change.patch,
-                additions : change.additions,
-                delitions : change.deletions,
-                previous_filename : change.previous_filename
+                additions: change.additions,
+                delitions: change.deletions,
+                previous_filename: change.previous_filename,
+
             }))
         })
 
-        if (changes.length == 0) return {message:"There is no changes in this PR ", skip:true}
+        if (changes.length == 0) return { message: "There is no changes in this PR ", skip: true }
+        //gpt-4o-mini
+        const aiResponse = await step.run("analyse-using-ai", async () => {
+            const llmResponse = await run(githubPullRequestReviewAgent,
+                `
+                    Pull Request Information:
+                    ${JSON.stringify(pullRequestInfo, null, 2)}
+                    \n\n
+                    Changes:
+                    ${JSON.stringify(changes, null, 2)}
+                `,
+            )
 
-        await step.run("analyse-using-ai", async ()=>{
-            
+            return {
+                result: llmResponse.finalOutput,
+            }
         })
 
-    })
+        await step.run('post-comment', async () => {
+            const { criticalFixes, suggestions, content } = aiResponse.result;
+
+            const sections = [content];
+
+            if (criticalFixes?.length)
+                sections.push(
+                    `**Critical Changes:**\n${criticalFixes.map((fix) => `- ${fix}`).join('\n')}`,
+                );
+
+            if (suggestions?.length)
+                sections.push(
+                    `**Suggestions:**\n${suggestions.map((suggestion) => `- ${suggestion}`).join('\n')}`,
+                );
+
+            await octokit.issues.createComment({
+                owner,
+                repo,
+                issue_number: pull_number,
+                body: sections.join('\n\n'),
+            });
+
+        })
+
+    },
+);
